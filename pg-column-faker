@@ -1,0 +1,1057 @@
+#!/usr/bin/env python
+
+import sys
+import argparse
+
+import psycopg2
+
+
+class Faker(object):
+
+    def __init__(self, database, user, password, host, port, action, schema,
+                 table, column, type, default=None, nullable=True,
+                 no_modify_columns=None, primary_key_columns=None,
+                 verbose=False):
+        """Create an importer to import a remote database's table-like objects
+        from the given schema into the given "local" database's schema.
+
+        :param database: The name of the database to import into.
+        :param user: The user to connect to the database as.
+        :param password: The password to connect to the database with.
+        :param host: The host of the database.
+        :param port: The port of the database.
+        :param action: The action to perform. Either "add" or "drop".
+        :param schema: The schema on the database to create objects in.
+        :param table: The table to add the column to.
+        :param column: The name of the columnto add.
+        :param type: The type of the new column.
+        :param default: The default value for the new column (default: None, no
+            default).
+        :param nullable: Whether or not the new column is nullable (default:
+            True).
+        :param no_modify_columns: A list of columns which are not managed by the
+            trigger that manages updates (default: None, no columns).
+        :param primary_key_columns: Specify the list of primary key columns. If
+            no list is given, an attempt will be made to determine the primary
+            key automatically (default: None, automatically determine).
+
+        :param verbose: If True, print SQL statements out as the script runs
+            (default: False).
+
+        """
+
+        self.database = database
+        self.user = user
+        self.password = password
+        self.host = host
+        self.port = port
+        self.action = action
+        self.target_schema = schema
+        self.target_table = table
+        self.column_name = column
+        self.column_type = type
+        self.column_default = default
+        self.column_nullable = nullable
+
+        self.no_modify_columns = no_modify_columns or []
+        self.primary_key_columns = primary_key_columns or []
+        
+        self.verbose = verbose
+
+    def run(self):
+        """Run add/drop logic with the configured settings."""
+
+        if self.action == "add":
+            return self.add()
+        elif self.action == "drop":
+            return self.drop()
+        else:
+            raise Exception("Implementation Error")
+
+    def add(self):
+        """Run the logic to add the given extra column."""
+
+        conn = None
+        cur = None
+        try:
+
+            # get a database connection
+            conn = self.connect()
+
+            # and a cursor
+            cur = conn.cursor()
+
+            # determine the name of the column table
+            column_table = self.column_table_name()
+
+            # determine the primary key of the target
+            primary_key = self.primary_key_for_table(cur, self.target_schema,
+                                                     self.target_table,
+                                                     column_table,
+                                                     self.primary_key_columns)
+
+            # ensure the fake column table exists
+            self.ensure_table(cur, self.target_schema, column_table,
+                              primary_key)
+
+            # check to see if the column exists
+            exists = self.check_for_column(cur, self.target_schema,
+                                           self.target_table,
+                                           self.column_name)
+            if exists:
+                raise Exception("Column already exists")
+
+            exists = self.check_for_column(cur, self.target_schema,
+                                           column_table, self.column_name)
+            if exists:
+                raise Exception("Column already exists")
+
+            # and add our new column to it
+            self.create_column(cur, self.target_schema, column_table,
+                               self.column_name, self.column_type,
+                               default=self.column_default,
+                               nullable=self.column_nullable)
+
+            # rename the table, if necessary
+            renamed_table = self.renamed_table_name()
+            self.rename_target_object(cur, self.target_schema,
+                                      self.target_table, renamed_table)
+
+            # drop the trigger that populates the real tables
+            view_name = self.view_name()
+            trigger_name = self.trigger_name()
+            self.drop_trigger(cur, self.target_schema, view_name, trigger_name)
+
+            # drop the function for the trigger
+            function_name = self.function_name()
+            self.drop_function(cur, self.target_schema, function_name)
+
+            # drop the view if it exists
+            self.drop_view(cur, self.target_schema, view_name)
+
+            # create the view as a join between the renamed table and the fake
+            # column table
+            self.create_view(cur, self.target_schema, view_name,
+                             renamed_table, column_table, primary_key)
+
+            # create the function for our trigger
+            self.create_function(cur, self.target_schema, function_name,
+                                 renamed_table, column_table, primary_key,
+                                 self.no_modify_columns)
+
+            # create the trigger to populate both sides
+            self.create_trigger(cur, self.target_schema, view_name,
+                                trigger_name, function_name)
+
+            # commit
+            conn.commit()
+
+        finally:
+            if cur is not None:
+                cur.close()
+
+            if conn is not None:
+                conn.close()
+
+    def drop(self):
+        """Run the logic to drop the given extra column."""
+
+        conn = None
+        cur = None
+        try:
+
+            # get a database connection
+            conn = self.connect()
+
+            # and a cursor
+            cur = conn.cursor()
+
+            # determine the name of the column table
+            column_table = self.column_table_name()
+
+            # determine the primary key of the target
+            primary_key = self.primary_key_for_table(cur, self.target_schema,
+                                                     self.target_table,
+                                                     column_table,
+                                                     self.primary_key_columns)
+
+            # check to see if the column exists
+            exists = self.check_for_column(cur, self.target_schema,
+                                           column_table, self.column_name)
+            if not exists:
+                raise Exception("Column does not exist")
+
+            # remove the trigger
+            view_name = self.view_name()
+            trigger_name = self.trigger_name()
+            self.drop_trigger(cur, self.target_schema, view_name, trigger_name)
+
+            # remove the function
+            function_name = self.function_name()
+            self.drop_function(cur, self.target_schema, function_name)
+
+            # remove the view
+            self.drop_view(cur, self.target_schema, view_name)
+
+            # remove the column from the column table
+            self.drop_column(cur, self.target_schema, column_table,
+                             self.column_name)
+
+            # check whether or not our extra columns table is doing anything
+            has_columns = self.check_for_any_extra_columns(cur,
+                                                           self.target_schema,
+                                                           column_table,
+                                                           primary_key)
+
+            # if the columns table is empty, remove it, and rename the original
+            # table back
+            if not has_columns:
+
+                # drop the empty table
+                self.drop_table(cur, self.target_schema, column_table)
+
+                # rename the table, if necessary
+                renamed_table = self.renamed_table_name()
+                self.rename_target_object(cur, self.target_schema,
+                                          renamed_table, self.target_table)
+
+            # otherwise, rebuild the view/function/trigger
+            else:
+
+                # create the view as a join between the renamed table and the
+                # fake column table
+                renamed_table = self.renamed_table_name()
+                self.create_view(cur, self.target_schema, view_name,
+                                 renamed_table, column_table, primary_key)
+
+                # create the function for our trigger
+                self.create_function(cur, self.target_schema, function_name,
+                                     renamed_table, column_table, primary_key,
+                                     self.no_modify_columns)
+
+                # create the trigger to populate both sides
+                self.create_trigger(cur, self.target_schema, view_name,
+                                    trigger_name, function_name)
+
+            # commit
+            conn.commit()
+
+        finally:
+            if cur is not None:
+                cur.close()
+
+            if conn is not None:
+                conn.close()
+
+    def connect(self):
+        """Create a connection to our database."""
+
+        conn = psycopg2.connect(database=self.database, user=self.user,
+                                password=self.password, host=self.host,
+                                port=self.port)
+
+        return conn
+
+    def column_table_name(self):
+        """Return the name of the extra columns table as assumed by this module.
+        
+        """
+
+        column_table = "__column_faker_{}_extra".format(self.target_table)
+        return column_table
+
+    def primary_key_for_table(self, cur, schema, target_table, column_table,
+                              primary_key_columns):
+        """Determine the primary key of the tables we are working with.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema containing the tables.
+        :param target_table: The name of the table we are targetting for column
+            add/remove.
+        :param column_table: The name of the extra columns table.
+        :param primary_key_columns: If given, this list will be used to
+            determine the primary key columns, ignoring any constraint
+            information.
+
+        """
+
+        if primary_key_columns:
+            cur.execute("""
+                select
+                    c.attname,
+                    pg_catalog.format_type(c.atttypid, c.atttypmod)
+                from
+                    pg_catalog.pg_namespace a
+                join
+                    pg_catalog.pg_class b
+                on
+                    a.oid = b.relnamespace
+                join
+                    pg_catalog.pg_attribute c
+                on
+                    b.oid = c.attrelid
+                where
+                    c.attnum > 0
+                    and not c.attisdropped
+                    and a.nspname = %s
+                    and b.relname = %s
+                    and c.attname = any(%s)
+                """, (schema, target_table, primary_key_columns))
+
+            results = cur.fetchall()
+            if len(results) == len(primary_key_columns):
+                return results
+            else:
+                found = [r[0] for r in results]
+                raise Exception("Given primary key columns '{}' don't "
+                                "completely match columns found in the table"
+                                .format(", ".join(primary_key_columns),
+                                        ", ".join(found)))
+
+        def get_cols(table):
+            cur.execute("""
+                select
+                    c.attname,
+                    pg_catalog.format_type(c.atttypid, c.atttypmod)
+                from
+                    pg_catalog.pg_namespace a
+                join
+                    pg_catalog.pg_class b
+                on
+                    a.oid = b.relnamespace
+                join
+                    pg_catalog.pg_attribute c
+                on
+                    b.oid = c.attrelid
+                join
+                    pg_catalog.pg_constraint d
+                on
+                    b.oid = d.conrelid
+                where
+                    c.attnum > 0
+                    and not c.attisdropped
+                    and a.nspname = %s
+                    and b.relname = %s
+                    and c.attnum = any(d.conkey)
+                    and d.contype = 'p'
+                """, (schema, table))
+
+            return cur.fetchall()
+
+        results = get_cols(target_table)
+        if results:
+            return results
+
+        results = get_cols(column_table)
+        if results:
+            return results
+
+        # if the table is a foreign table, we may not know what the primary key
+        # is... try guessing that it's the first column
+        sys.stderr.write('Unable to determine primary key for "{}"."{}"\n'
+                         .format(schema, target_table))
+        sys.stderr.write("Going to guess primary key\n")
+        sys.stderr.flush()
+
+        def guess_cols(table):
+            cur.execute("""
+                select
+                    c.attname,
+                    pg_catalog.format_type(c.atttypid, c.atttypmod)
+                from
+                    pg_catalog.pg_namespace a
+                join
+                    pg_catalog.pg_class b
+                on
+                    a.oid = b.relnamespace
+                join
+                    pg_catalog.pg_attribute c
+                on
+                    b.oid = c.attrelid
+                where
+                    c.attnum > 0
+                    and not c.attisdropped
+                    and a.nspname = %s
+                    and b.relname = %s
+                order by
+                    c.attnum
+                limit
+                    1
+                """, (schema, table))
+
+            return cur.fetchall()
+
+        results = guess_cols(target_table)
+        if results:
+            cols = [r[0] for r in results]
+            sys.stderr.write("Guessing '{}'\n".format(", ".join(cols)))
+            sys.stderr.flush()
+            return results
+
+        results = guess_cols(column_table)
+        if results:
+            cols = [r[0] for r in results]
+            sys.stderr.write("Guessing '{}'\n".format(", ".join(cols)))
+            sys.stderr.flush()
+            return results
+
+        raise Exception('Unable to determine primary key for "{}"."{}"'
+                        .format(schema, target_table))
+
+    def ensure_table(self, cur, schema, table, primary_key):
+        """Ensure the table of the given name exists.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema to create the table in.
+        :param table: The name of the table.
+        :param primary_key: The primary key of the table as a list of
+            (name, type) tuples.
+
+        """
+
+        create = 'create table if not exists "{}"."{}" (\n'.format(schema,
+                                                                   table)
+        primary_names = []
+        columns_clause = []
+        for name, definition in primary_key:
+            name = name.replace("%", "%%")
+            columns_clause.append('    "{}" {}'.format(name, definition))
+            primary_names.append('"{}"'.format(name))
+
+        create += ",\n".join(columns_clause)
+
+        create += ",\n    primary key (" + ", ".join(primary_names) + ")"
+
+        create += "\n)\n"
+
+        if self.verbose:
+            print(create)
+        cur.execute(create)
+
+    def check_for_column(self, cur, schema, table, column):
+        """Determine if the given column exists in the given table.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema of the table.
+        :param table: The name of the table.
+        :param column: The name of the column to check for.
+
+        """
+
+        cur.execute("""
+            select
+                count(*)
+            from
+                pg_catalog.pg_namespace a
+            join
+                pg_catalog.pg_class b
+            on
+                a.oid = b.relnamespace
+            join
+                pg_catalog.pg_attribute c
+            on
+                b.oid = c.attrelid
+            where
+                c.attnum > 0
+                and not c.attisdropped
+                and a.nspname = %s
+                and b.relname = %s
+                and c.attname = %s
+            """, (schema, table, column))
+
+        res = cur.fetchone()
+        return res[0] != 0
+
+    def create_column(self, cur, schema, table, column, type, default=None,
+                      nullable=True):
+        """Create the given column on the given table.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema of the table.
+        :param table: The name of the table.
+        :param column: The name of the column to create.
+        :param type: The type of the column.
+        :param default: The default value for the column.
+        :param nullable: Whether or not the column is nullable.
+
+        """
+
+        stmt = """
+            alter table "{}"."{}"
+                add column "{}" {}
+        """.format(schema, table, column, type)
+
+        if default is not None:
+            stmt += " default " + default
+
+        if not nullable:
+            stmt += " not null"
+            
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+    def renamed_table_name(self):
+        """Return the name of the original, renamed table as assumed by this
+        module.
+        
+        """
+
+        table = "__column_faker_{}_original".format(self.target_table)
+        return table
+
+    def rename_target_object(self, cur, schema, old_name, new_name):
+        """Rename the given target object to the new name.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema to find the object in.
+        :param old_name: The old (potentially current) name of the object.
+        :param new_name The new name to give the object.
+
+        """
+
+        cur.execute("""
+            select
+                b.relkind
+            from
+                pg_catalog.pg_namespace a
+            join
+                pg_catalog.pg_class b
+            on
+                a.oid = b.relnamespace
+            where
+                a.nspname = %s
+                and b.relname = %s
+            """, (schema, old_name))
+
+        res = cur.fetchone()
+
+        # if res is None, we've (probably) already renamed the table
+        if res is not None:
+            if res[0] == "r":
+                stmt = """
+                    alter table "{}"."{}"
+                        rename to "{}"
+                    """.format(schema, old_name, new_name)
+                if self.verbose:
+                    print(stmt)
+                cur.execute(stmt)
+            elif res[0] == "f":
+                stmt = """
+                    alter foreign table "{}"."{}"
+                        rename to "{}"
+                    """.format(schema, old_name, new_name)
+                if self.verbose:
+                    print(stmt)
+                cur.execute(stmt)
+            else:
+                raise Exception("Unexpected object type '{}'".format(res[0]))
+
+    def view_name(self):
+        """Return the name of the view as assumed by this module."""
+
+        return self.target_table
+
+    def trigger_name(self):
+        """Return the name of the trigger managing inserts into the original
+        table and extra columns table as assumed by this module.
+        
+        """
+
+        trigger = "__column_faker_{}_trigger".format(self.target_table)
+        return trigger
+
+    def drop_trigger(self, cur, schema, object_name, trigger_name):
+        """Remove the given trigger from the given object.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema of the object with the trigger.
+        :param object_name: The object possessing the trigger.
+        :param trigger_name: The name of the trigger.
+
+        """
+
+        cur.execute("""
+            select
+                count(*)
+            from
+                pg_catalog.pg_namespace a
+            join
+                pg_catalog.pg_class b
+            on
+                a.oid = b.relnamespace
+            where
+                a.nspname = %s
+                and b.relname = %s
+            """, (schema, object_name))
+
+        res = cur.fetchone()
+        if res[0] != 0:
+            stmt = """
+                drop trigger if exists "{}"
+                    on "{}"."{}"
+                """.format(trigger_name, schema, object_name)
+
+            if self.verbose:
+                print(stmt)
+            cur.execute(stmt)
+
+    def function_name(self):
+        """Return the name of the function managing inserts into the original
+        table and extra columns table as assumed by this module.
+        
+        """
+
+        function = "__column_faker_{}_func".format(self.target_table)
+        return function
+
+    def drop_function(self, cur, schema, name):
+        """Remove the given function.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema of the function.
+        :param name: The name of the function.
+
+        """
+
+        stmt = 'drop function if exists "{}"."{}"()'.format(schema, name)
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+    def drop_view(self, cur, schema, name):
+        """Remove the given view.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema of the view.
+        :param name: The name of the view.
+
+        """
+
+        stmt = 'drop view if exists "{}"."{}"'.format(schema, name)
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+    def drop_table(self, cur, schema, name):
+        """Remove the given table.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema of the table.
+        :param name: The name of the table.
+
+        """
+
+        stmt = 'drop table "{}"."{}"'.format(schema, name)
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+    def drop_column(self, cur, schema, name, column):
+        """Remove the given column from the given table.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema of the table.
+        :param name: The name of the table.
+        :param column: The name of the column.
+
+        """
+
+        stmt = """
+            alter table "{}"."{}"
+                drop column "{}"
+            """.format(schema, name, column)
+
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+    def check_for_any_extra_columns(self, cur, schema, name, primary_key):
+        """Determine if the extra columns table actually contains any extra
+        columns.
+
+        :param A psycopg2 cursor object.
+        :param schema: The schema of the extra columns table.
+        :param name: The name of the table.
+        :param primary_key: The primary key of the table as a list of
+            (name, type) tuples.
+
+        """
+
+        cur.execute("""
+            select
+                c.attname
+            from
+                pg_catalog.pg_namespace a
+            join
+                pg_catalog.pg_class b
+            on
+                a.oid = b.relnamespace
+            join
+                pg_catalog.pg_attribute c
+            on
+                b.oid = c.attrelid
+            where
+                c.attnum > 0
+                and not c.attisdropped
+                and a.nspname = %s
+                and b.relname = %s
+            """, (schema, name))
+
+        results = cur.fetchall()
+        
+        primary_key_cols = [p[0] for p in primary_key]
+        for result in results:
+            if result[0] not in primary_key_cols:
+                return True
+        return False
+
+    def create_view(self, cur, schema, name, parent_table, extra_table,
+                    primary_key):
+        """Create the view that joins that original source table and the extra
+        columns table together.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema for all of the objects.
+        :param name: The name of the view.
+        :param parent_table: The name of the original table, now since renamed.
+        :param extra_table: The table containing the extra columns.
+        :param primary_key: The primary key of the table as a list of
+            (name, type) tuples.
+
+        """
+
+        cur.execute("""
+            select
+                c.attname,
+                (
+                    select
+                        pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+                    from
+                        pg_catalog.pg_attrdef d
+                    where
+                        d.adrelid = c.attrelid
+                        and d.adnum = c.attnum
+                        and c.atthasdef
+                )
+            from
+                pg_catalog.pg_namespace a
+            join
+                pg_catalog.pg_class b
+            on
+                a.oid = b.relnamespace
+            join
+                pg_catalog.pg_attribute c
+            on
+                b.oid = c.attrelid
+            where
+                c.attnum > 0
+                and not c.attisdropped
+                and a.nspname = %s
+                and b.relname = %s
+            """, (schema, extra_table))
+
+        added_columns = cur.fetchall()
+
+        primary_key_cols = [p[0] for p in primary_key]
+
+        extra_cols = []
+        for column, default in added_columns:
+            if column in primary_key_cols:
+                continue
+
+            if default is not None:
+                # use any pkey column to determine if our join found a match or
+                # not. since the primary key columns can never be null, we can
+                # be certain the result will only be null if no matching record
+                # is found.
+                a_pkey_col = primary_key_cols[0]
+                expr = (
+                    'case when b."{}" is null then {} else b."{}" end as "{}"'
+                    .format(a_pkey_col, default, column, column)
+                )
+                extra_cols.append(expr)
+            else:
+                extra_cols.append('"{}"'.format(column))
+
+        extra_cols = ",\n".join(extra_cols)
+
+        join_cond = []
+        for col, _ in primary_key:
+            join_cond.append('a."{col}" = b."{col}"'.format(col=col))
+        join_cond = " and ".join(join_cond)
+
+        stmt = """
+            create view "{schema}"."{name}" as
+            select
+                a.*,
+                {extra_cols}
+            from
+                "{schema}"."{parent_table}" a
+            left join
+                "{schema}"."{extra_table}" b
+            on
+                {join_cond}
+            """.format(schema=schema, name=name, extra_cols=extra_cols,
+                       parent_table=parent_table, extra_table=extra_table,
+                       join_cond=join_cond)
+
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+    def create_function(self, cur, schema, name, parent_table, extra_table,
+                        primary_key, no_modify_columns):
+        """Create the function that manages insertions, updates, and deletions
+        to/from the original table and the extra columns table.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema for all of the objects.
+        :param name: The name of the view.
+        :param parent_table: The name of the original table, now since renamed.
+        :param extra_table: The table containing the extra columns.
+        :param primary_key: The primary key of the table as a list of
+            (name, type) tuples.
+        :param no_modify_columns: A list of columns which this function is not
+            to modify. This is useful for columns that are maintained by
+            triggers already and should not be updated directly.
+
+        """
+
+        primary_key_cols = "{"
+        for col, _ in primary_key:
+            primary_key_cols += '"{}"'.format(col)
+        primary_key_cols += "}"
+
+        no_modify_cols = "{"
+        for col in no_modify_columns:
+            no_modify_cols += '"{}"'.format(col)
+        no_modify_cols += "}"
+
+        stmt = """
+            create or replace function "{schema}"."{name}"()
+            returns trigger
+            as $$
+            declare
+                pkey_cols text[] := '{primary_key_cols}';
+                ignore_cols text[] := '{no_modify_cols}';
+                table_cols text[];
+                kv hstore;
+
+                cols_stmt text;
+                values_stmt text;
+                set_stmt text;
+                where_stmt text;
+                update_count integer;
+                stmt text;
+                table_name text;
+                col_name text;
+            begin
+                if TG_WHEN <> 'INSTEAD OF' then
+                    raise exception 'this function can only be invoked as an INSTEAD OF trigger';
+                end if;
+
+                for table_name in select unnest(array['{parent_table}', '{extra_table}']) loop
+                    table_cols := array(
+                        select
+                            c.attname
+                        from
+                            pg_catalog.pg_namespace a
+                        join
+                            pg_catalog.pg_class b
+                        on
+                            a.oid = b.relnamespace
+                        join
+                            pg_catalog.pg_attribute c
+                        on
+                            b.oid = c.attrelid
+                        where
+                            a.nspname = '{schema}'
+                            and b.relname = table_name
+                            and not c.attisdropped
+                            and c.attnum > 0
+                    );
+
+                    if TG_OP = 'INSERT' then
+                        cols_stmt := '';
+                        values_stmt := '';
+
+                        kv := hstore(NEW.*);
+
+                        for col_name in select unnest(table_cols) loop
+                            if col_name = any(ignore_cols) then
+                                continue;
+                            end if;
+                            cols_stmt := cols_stmt || quote_ident(col_name) || ', ';
+                            values_stmt := values_stmt || quote_nullable(kv->col_name) || ', ';
+                        end loop;
+
+                        cols_stmt := regexp_replace(cols_stmt, ', $', '');
+                        values_stmt := regexp_replace(values_stmt, ', $', '');
+
+                        stmt := 'insert into "{schema}".' || quote_ident(table_name) || ' '
+                            || '(' || cols_stmt || ') values (' || values_stmt || ')';
+
+                        execute stmt;
+                    elsif TG_OP = 'UPDATE' then
+                        set_stmt := '';
+                        where_stmt := '';
+                        
+                        kv = hstore(NEW.*);
+
+                        for col_name in select unnest(table_cols) loop
+                            if col_name = any(ignore_cols) then
+                                continue;
+                            end if;
+                            set_stmt := set_stmt || quote_ident(col_name)
+                                || ' = ' || quote_nullable(kv->col_name) || ', ';
+                        end loop;
+
+                        set_stmt = regexp_replace(set_stmt, ', $', '');
+
+                        for col_name in select unnest(pkey_cols) loop
+                            where_stmt := where_stmt || ' and '
+                                || quote_ident(col_name) || ' = '
+                                || quote_nullable(kv->col_name);
+                        end loop;
+
+                        where_stmt := regexp_replace(where_stmt, '^ and ', '');
+
+                        stmt := 'update "{schema}".' || quote_ident(table_name) || ' '
+                            || 'set ' || set_stmt || ' where ' || where_stmt;
+
+                        execute stmt;
+
+                        get diagnostics update_count = row_count;
+                        if update_count = 0 then
+                            cols_stmt := '';
+                            values_stmt := '';
+
+                            kv := hstore(NEW.*);
+
+                            for col_name in select unnest(table_cols) loop
+                                if col_name = any(ignore_cols) then
+                                    continue;
+                                end if;
+                                cols_stmt := cols_stmt || quote_ident(col_name) || ', ';
+                                values_stmt := values_stmt || quote_nullable(kv->col_name) || ', ';
+                            end loop;
+
+                            cols_stmt := regexp_replace(cols_stmt, ', $', '');
+                            values_stmt := regexp_replace(values_stmt, ', $', '');
+
+                            stmt := 'insert into "{schema}".' || quote_ident(table_name) || ' '
+                                || '(' || cols_stmt || ') values (' || values_stmt || ')';
+
+                            execute stmt;
+                        end if;
+                    elsif TG_OP = 'DELETE' then
+                        where_stmt := '';
+
+                        kv := hstore(OLD.*);
+
+                        for col_name in select unnest(pkey_cols) loop
+                            where_stmt := where_stmt || ' and '
+                                || quote_ident(col_name) || ' = '
+                                || quote_nullable(kv->col_name);
+                        end loop;
+
+                        where_stmt := regexp_replace(where_stmt, '^ and ', '');
+
+                        stmt := 'delete from "{schema}".' || qoute_ident(table_name)
+                            || ' where ' || where_stmt;
+
+                        execute stmt;
+                    else
+                        raise exception 'Implementation Error';
+                    end if;
+                end loop;
+
+                if TG_OP = 'INSERT' then
+                    return NEW;
+                elsif TG_OP = 'UPDATE' then
+                    return NEW;
+                elsif TG_OP = 'DELETE' then
+                    return OLD;
+                else
+                    raise exception 'Implementation Error';
+                end if;
+            end
+            $$ language plpgsql;
+            """.format(schema=schema, name=name, parent_table=parent_table,
+                       extra_table=extra_table,
+                       primary_key_cols=primary_key_cols,
+                       no_modify_cols=no_modify_cols)
+
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+    def create_trigger(self, cur, schema, object_name, trigger_name,
+                       function_name):
+        """Create the trigger that manages insertions, updates, and deletions
+        to/from the original table and the extra columns table.
+
+        :param cur: A psycopg2 cursor object.
+        :param schema: The schema for all of the objects.
+        :param object_name: The name of the object to attach the trigger to.
+        :param trigger_name: The name of the trigger.
+        :param function_name: The name of the trigger function.
+
+        """
+
+        stmt = """
+            create trigger "{trigger_name}"
+                instead of insert or update or delete
+                on "{schema}"."{object_name}"
+                for each row
+                    execute procedure "{schema}"."{function_name}"()
+            """.format(schema=schema, object_name=object_name,
+                       trigger_name=trigger_name, function_name=function_name)
+
+        if self.verbose:
+            print(stmt)
+        cur.execute(stmt)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--database", required=True)
+    parser.add_argument("--user", required=True)
+    parser.add_argument("--password", required=True)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--port", required=True)
+    parser.add_argument("--action", default="add", choices=["add", "drop"])
+    parser.add_argument("--schema", required=True)
+    parser.add_argument("--table", required=True)
+    parser.add_argument("--column", required=True)
+    parser.add_argument("--type", required=True)
+    parser.add_argument("--default")
+    parser.add_argument("--not-nullable", action="store_true", default=False)
+    parser.add_argument("--no-modify-columns", default="")
+    parser.add_argument("--primary-key-columns", default="")
+
+    parser.add_argument("--verbose", action="store_true", default=False)
+
+    args = parser.parse_args()
+
+    if args.no_modify_columns:
+        no_modify_columns = args.no_modify_columns.split(",")
+        no_modify_columns = [c.strip() for c in no_modify_columns if c]
+    else:
+        no_modify_columns = None
+
+    if args.primary_key_columns:
+        primary_key_columns = args.primary_key_columns.split(",")
+        primary_key_columns = [c.strip() for c in primary_key_columns if c]
+    else:
+        primary_key_columns = None
+
+    faker = Faker(args.database, args.user, args.password, args.host, args.port,
+                  args.action, args.schema, args.table, args.column, args.type,
+                  default=args.default, nullable=(not args.not_nullable),
+                  no_modify_columns=no_modify_columns,
+                  primary_key_columns=primary_key_columns, verbose=args.verbose)
+    faker.run()
+

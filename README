@@ -1,0 +1,280 @@
+Add columns to a table without really adding columns to table.
+
+Call pg-column-faker with -h for help.
+
+Requires python and psycopg2.
+
+You're probably thinking "this is idiotic. you already have permission to alter
+the table. why not just... alter the table?" This tool is particularly useful
+if what you've got is a foreign table mapped locally for testing, and you need
+to add a column to that table... but can't.
+
+Examples:
+
+~$ psql -d derp
+[derp]> create table faker_test(id serial primary key, value text);
+CREATE TABLE
+[derp]> insert into faker_test (id, value) values (default, 'hello');
+INSERT 0 1
+[derp]> select * from faker_test;
+ id | value 
+----+-------
+  1 | hello
+[derp]> \q
+~$ pg-column-faker \
+>    --database derp \
+>    --user ryan \
+>    --password XXX \
+>    --host localhost \
+>    --port 5432 \
+>    --schema public \
+>    --table faker_test \
+>    --column test \
+>    --type boolean \
+>    --default false \
+>    --verbose
+create table if not exists "public"."__column_faker_faker_test_extra" (
+    "id" integer,
+    primary key ("id")
+)
+
+
+            alter table "public"."__column_faker_faker_test_extra"
+                add column "test" boolean
+         default false
+
+                    alter foreign table "public"."faker_test"
+                        rename to "__column_faker_faker_test_original"
+                    
+drop function if exists "public"."__column_faker_faker_test_func"()
+drop view if exists "public"."faker_test"
+
+            create view "public"."faker_test" as
+            select
+                a.*,
+                case when b."id" is null then false else b."test" end as "test"
+            from
+                "public"."__column_faker_faker_test_original" a
+            left join
+                "public"."__column_faker_faker_test_extra" b
+            on
+                a."id" = b."id"
+            
+
+            create or replace function "public"."__column_faker_faker_test_func"()
+            returns trigger
+            as $$
+            declare
+                pkey_cols text[] := '{"id"}';
+                ignore_cols text[] := '{}';
+                table_cols text[];
+                kv hstore;
+
+                cols_stmt text;
+                values_stmt text;
+                set_stmt text;
+                where_stmt text;
+                update_count integer;
+                stmt text;
+                table_name text;
+                col_name text;
+            begin
+                if TG_WHEN <> 'INSTEAD OF' then
+                    raise exception 'this function can only be invoked as an INSTEAD OF trigger';
+                end if;
+
+                for table_name in select unnest(array['__column_faker_faker_test_original', '__column_faker_faker_test_extra']) loop
+                    table_cols := array(
+                        select
+                            c.attname
+                        from
+                            pg_catalog.pg_namespace a
+                        join
+                            pg_catalog.pg_class b
+                        on
+                            a.oid = b.relnamespace
+                        join
+                            pg_catalog.pg_attribute c
+                        on
+                            b.oid = c.attrelid
+                        where
+                            a.nspname = 'public'
+                            and b.relname = table_name
+                            and not c.attisdropped
+                            and c.attnum > 0
+                    );
+
+                    if TG_OP = 'INSERT' then
+                        cols_stmt := '';
+                        values_stmt := '';
+
+                        kv := hstore(NEW.*);
+
+                        for col_name in select unnest(table_cols) loop
+                            if col_name = any(ignore_cols) then
+                                continue;
+                            end if;
+                            cols_stmt := cols_stmt || quote_ident(col_name) || ', ';
+                            values_stmt := values_stmt || quote_nullable(kv->col_name) || ', ';
+                        end loop;
+
+                        cols_stmt := regexp_replace(cols_stmt, ', $', '');
+                        values_stmt := regexp_replace(values_stmt, ', $', '');
+
+                        stmt := 'insert into "public".' || quote_ident(table_name) || ' '
+                            || '(' || cols_stmt || ') values (' || values_stmt || ')';
+
+                        execute stmt;
+                    elsif TG_OP = 'UPDATE' then
+                        set_stmt := '';
+                        where_stmt := '';
+                        
+                        kv = hstore(NEW.*);
+
+                        for col_name in select unnest(table_cols) loop
+                            if col_name = any(ignore_cols) then
+                                continue;
+                            end if;
+                            set_stmt := set_stmt || quote_ident(col_name)
+                                || ' = ' || quote_nullable(kv->col_name) || ', ';
+                        end loop;
+
+                        set_stmt = regexp_replace(set_stmt, ', $', '');
+
+                        for col_name in select unnest(pkey_cols) loop
+                            where_stmt := where_stmt || ' and '
+                                || quote_ident(col_name) || ' = '
+                                || quote_nullable(kv->col_name);
+                        end loop;
+
+                        where_stmt := regexp_replace(where_stmt, '^ and ', '');
+
+                        stmt := 'update "public".' || quote_ident(table_name) || ' '
+                            || 'set ' || set_stmt || ' where ' || where_stmt;
+
+                        execute stmt;
+
+                        get diagnostics update_count = row_count;
+                        if update_count = 0 then
+                            cols_stmt := '';
+                            values_stmt := '';
+
+                            kv := hstore(NEW.*);
+
+                            for col_name in select unnest(table_cols) loop
+                                if col_name = any(ignore_cols) then
+                                    continue;
+                                end if;
+                                cols_stmt := cols_stmt || quote_ident(col_name) || ', ';
+                                values_stmt := values_stmt || quote_nullable(kv->col_name) || ', ';
+                            end loop;
+
+                            cols_stmt := regexp_replace(cols_stmt, ', $', '');
+                            values_stmt := regexp_replace(values_stmt, ', $', '');
+
+                            stmt := 'insert into "public".' || quote_ident(table_name) || ' '
+                                || '(' || cols_stmt || ') values (' || values_stmt || ')';
+
+                            execute stmt;
+                        end if;
+                    elsif TG_OP = 'DELETE' then
+                        where_stmt := '';
+
+                        kv := hstore(OLD.*);
+
+                        for col_name in select unnest(pkey_cols) loop
+                            where_stmt := where_stmt || ' and '
+                                || quote_ident(col_name) || ' = '
+                                || quote_nullable(kv->col_name);
+                        end loop;
+
+                        where_stmt := regexp_replace(where_stmt, '^ and ', '');
+
+                        stmt := 'delete from "public".' || qoute_ident(table_name)
+                            || ' where ' || where_stmt;
+
+                        execute stmt;
+                    else
+                        raise exception 'Implementation Error';
+                    end if;
+                end loop;
+
+                if TG_OP = 'INSERT' then
+                    return NEW;
+                elsif TG_OP = 'UPDATE' then
+                    return NEW;
+                elsif TG_OP = 'DELETE' then
+                    return OLD;
+                else
+                    raise exception 'Implementation Error';
+                end if;
+            end
+            $$ language plpgsql;
+            
+
+            create trigger "__column_faker_faker_test_trigger"
+                instead of insert or update or delete
+                on "public"."faker_test"
+                for each row
+                    execute procedure "public"."__column_faker_faker_test_func"()
+~$ psql -d derp
+[derp]> select * from faker_test;
+ id | value | test 
+----+-------+------
+  1 | hello | f
+[derp]> update faker_test set test = true where id = 1;
+UPDATE 1
+[derp]> select * from faker_test;
+ id | value | test 
+----+-------+------
+  1 | hello | t
+[derp]> insert into faker_test (id, value, test) values (default, 'bye', true);
+INSERT 0 1
+[derp]> select * from faker_test;
+ id | value | test 
+----+-------+------
+  1 | hello | t
+  2 | bye   | t
+[derp]> \q
+~$ pg-column-faker \
+>    --database derp \
+>    --user ryan \
+>    --password XXX \
+>    --host localhost \
+>    --port 5432 \
+>    --schema public \
+>    --table faker_test \
+>    --column test \
+>    --type boolean \
+>    --default false \
+>    --action drop
+>    --verbose
+                drop trigger if exists "__column_faker_faker_test_trigger"
+                    on "public"."faker_test"
+                
+drop function if exists "public"."__column_faker_faker_test_func"()
+drop view if exists "public"."faker_test"
+
+            alter table "public"."__column_faker_faker_test_extra"
+                drop column "test"
+            
+drop table "public"."__column_faker_faker_test_extra"
+
+                    alter foreign table "public"."__column_faker_faker_test_original"
+                        rename to "faker_test"
+~$ psql -d derp
+[derp]> select * from faker_test;
+ id | value  
+----+-------
+  1 | hello 
+  2 | bye   
+[derp]>
+
+Magic.
+
+As you'll see, the original table is renamed, a new table is created, and the
+original table is replaced with a view. An INSTEAD OF trigger is created on the
+view which manages updating, inserting, and deleting from both tables. Multiple
+columns may be added. If all columns are removed, the view and associated
+machinery are removed and the table is restored to its original name.
+
