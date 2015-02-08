@@ -348,8 +348,9 @@ class Faker(object):
 
         # if the table is a foreign table, we may not know what the primary key
         # is... try guessing that it's the first column
-        sys.stderr.write('Unable to determine primary key for "{}"."{}"\n'
-                         .format(schema, target_table))
+        sys.stderr.write("Unable to determine primary key for {}.{}\n"
+                         .format(self.quote_ident(schema),
+                                 self.quote_ident(target_table)))
         sys.stderr.write("Going to guess primary key\n")
         sys.stderr.flush()
 
@@ -395,8 +396,9 @@ class Faker(object):
             sys.stderr.flush()
             return results
 
-        raise Exception('Unable to determine primary key for "{}"."{}"'
-                        .format(schema, target_table))
+        raise Exception("Unable to determine primary key for {}.{}"
+                        .format(self.quote_ident(schema),
+                                self.quote_ident(target_table)))
 
     def ensure_table(self, cur, schema, table, primary_key):
         """Ensure the table of the given name exists.
@@ -409,14 +411,15 @@ class Faker(object):
 
         """
 
-        create = 'create table if not exists "{}"."{}" (\n'.format(schema,
-                                                                   table)
+        create = ("create table if not exists {}.{} (\n"
+                  .format(self.quote_ident(schema), self.quote_ident(table)))
         primary_names = []
         columns_clause = []
         for name, definition in primary_key:
             name = name.replace("%", "%%")
-            columns_clause.append('    "{}" {}'.format(name, definition))
-            primary_names.append('"{}"'.format(name))
+            columns_clause.append("    {} {}".format(self.quote_ident(name),
+                                                     definition))
+            primary_names.append(self.quote_ident(name))
 
         create += ",\n".join(columns_clause)
 
@@ -477,12 +480,13 @@ class Faker(object):
         """
 
         stmt = """
-            alter table "{}"."{}"
-                add column "{}" {}
-        """.format(schema, table, column, type)
+            alter table {}.{}
+                add column {} {}
+        """.format(self.quote_ident(schema), self.quote_ident(table),
+                   self.quote_ident(column), self.quote_ident(type))
 
         if default is not None:
-            stmt += " default " + default
+            stmt += " default " + self.escape(default)
 
         if not nullable:
             stmt += " not null"
@@ -530,17 +534,21 @@ class Faker(object):
         if res is not None:
             if res[0] == "r":
                 stmt = """
-                    alter table "{}"."{}"
-                        rename to "{}"
-                    """.format(schema, old_name, new_name)
+                    alter table {}.{}
+                        rename to {}
+                    """.format(self.quote_ident(schema),
+                               self.quote_ident(old_name),
+                               self.quote_ident(new_name))
                 if self.verbose:
                     print(stmt)
                 cur.execute(stmt)
             elif res[0] == "f":
                 stmt = """
-                    alter foreign table "{}"."{}"
-                        rename to "{}"
-                    """.format(schema, old_name, new_name)
+                    alter foreign table {}.{}
+                        rename to {}
+                    """.format(self.quote_ident(schema),
+                               self.quote_ident(old_name),
+                               self.quote_ident(new_name))
                 if self.verbose:
                     print(stmt)
                 cur.execute(stmt)
@@ -588,9 +596,11 @@ class Faker(object):
         res = cur.fetchone()
         if res[0] != 0:
             stmt = """
-                drop trigger if exists "{}"
-                    on "{}"."{}"
-                """.format(trigger_name, schema, object_name)
+                drop trigger if exists {}
+                    on {}.{}
+                """.format(self.quote_ident(trigger_name),
+                           self.quote_ident(schema),
+                           self.quote_ident(object_name))
 
             if self.verbose:
                 print(stmt)
@@ -614,7 +624,8 @@ class Faker(object):
 
         """
 
-        stmt = 'drop function if exists "{}"."{}"()'.format(schema, name)
+        stmt = ("drop function if exists {}.{}()"
+                .format(self.quote_ident(schema), self.quote_ident(name)))
         if self.verbose:
             print(stmt)
         cur.execute(stmt)
@@ -628,7 +639,8 @@ class Faker(object):
 
         """
 
-        stmt = 'drop view if exists "{}"."{}"'.format(schema, name)
+        stmt = "drop view if exists {}.{}".format(self.quote_ident(schema),
+                                                  self.quote_ident(name))
         if self.verbose:
             print(stmt)
         cur.execute(stmt)
@@ -642,7 +654,8 @@ class Faker(object):
 
         """
 
-        stmt = 'drop table "{}"."{}"'.format(schema, name)
+        stmt = "drop table {}.{}".format(self.quote_ident(schema),
+                                         self.quote_ident(name))
         if self.verbose:
             print(stmt)
         cur.execute(stmt)
@@ -658,9 +671,10 @@ class Faker(object):
         """
 
         stmt = """
-            alter table "{}"."{}"
-                drop column "{}"
-            """.format(schema, name, column)
+            alter table {}.{}
+                drop column {}
+            """.format(self.quote_ident(schema), self.quote_ident(name),
+                       self.quote_ident(column))
 
         if self.verbose:
             print(stmt)
@@ -767,33 +781,38 @@ class Faker(object):
                 # is found.
                 a_pkey_col = primary_key_cols[0]
                 expr = (
-                    'case when b."{}" is null then {} else b."{}" end as "{}"'
-                    .format(a_pkey_col, default, column, column)
+                    "case when b.{} is null then {} else b.{} end as {}"
+                    .format(self.quote_ident(a_pkey_col),
+                            self.quote_ident(default), self.quote_ident(column),
+                            self.quote_ident(column))
                 )
                 extra_cols.append(expr)
             else:
-                extra_cols.append('"{}"'.format(column))
+                extra_cols.append(self.quote_ident(column))
 
         extra_cols = ",\n".join(extra_cols)
 
         join_cond = []
         for col, _ in primary_key:
-            join_cond.append('a."{col}" = b."{col}"'.format(col=col))
+            join_cond.append("a.{col} = b.{col}"
+                             .format(col=self.quote_ident(col)))
         join_cond = " and ".join(join_cond)
 
         stmt = """
-            create view "{schema}"."{name}" as
+            create view {schema}.{name} as
             select
                 a.*,
                 {extra_cols}
             from
-                "{schema}"."{parent_table}" a
+                {schema}.{parent_table} a
             left join
-                "{schema}"."{extra_table}" b
+                {schema}.{extra_table} b
             on
                 {join_cond}
-            """.format(schema=schema, name=name, extra_cols=extra_cols,
-                       parent_table=parent_table, extra_table=extra_table,
+            """.format(schema=self.quote_ident(schema),
+                       name=self.quote_ident(name), extra_cols=extra_cols,
+                       parent_table=self.quote_ident(parent_table),
+                       extra_table=self.quote_ident(extra_table),
                        join_cond=join_cond)
 
         if self.verbose:
@@ -820,16 +839,16 @@ class Faker(object):
 
         primary_key_cols = "{"
         for col, _ in primary_key:
-            primary_key_cols += '"{}"'.format(col)
+            primary_key_cols += self.quote_ident(col)
         primary_key_cols += "}"
 
         no_modify_cols = "{"
         for col in no_modify_columns:
-            no_modify_cols += '"{}"'.format(col)
+            no_modify_cols += self.quote_ident(col)
         no_modify_cols += "}"
 
         stmt = """
-            create or replace function "{schema}"."{name}"()
+            create or replace function {schema}.{name}"()
             returns trigger
             as $$
             declare
@@ -978,8 +997,10 @@ class Faker(object):
                 end if;
             end
             $$ language plpgsql;
-            """.format(schema=schema, name=name, parent_table=parent_table,
-                       extra_table=extra_table,
+            """.format(schema=self.quote_ident(schema),
+                       name=self.quote_ident(name),
+                       parent_table=self.escape(parent_table),
+                       extra_table=self.escape(extra_table),
                        primary_key_cols=primary_key_cols,
                        no_modify_cols=no_modify_cols)
 
@@ -1001,17 +1022,26 @@ class Faker(object):
         """
 
         stmt = """
-            create trigger "{trigger_name}"
+            create trigger {trigger_name}
                 instead of insert or update or delete
-                on "{schema}"."{object_name}"
+                on {schema}.{object_name}
                 for each row
-                    execute procedure "{schema}"."{function_name}"()
-            """.format(schema=schema, object_name=object_name,
-                       trigger_name=trigger_name, function_name=function_name)
+                    execute procedure {schema}.{function_name}()
+            """.format(schema=self.quote_ident(schema),
+                       object_name=self.quote_ident(object_name),
+                       trigger_name=self.quote_ident(trigger_name),
+                       function_name=self.quote_ident(function_name))
 
         if self.verbose:
             print(stmt)
         cur.execute(stmt)
+
+    def quote_ident(self, name):
+        name = name.replace('"', '""')
+        return '"' + name + '"'
+
+    def escape(self, val):
+        return val.replace("'", "''")
 
 
 if __name__ == "__main__":
